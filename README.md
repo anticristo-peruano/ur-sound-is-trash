@@ -1,2 +1,3 @@
-# ur-sound-is-trash
+# 🗣️🗣️🗣️ UR SOUND IS TRASH 🗣️🗣️🗣️
+
 Que rebote dumdumdumdumdumdumbai.
