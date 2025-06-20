@@ -1,6 +1,8 @@
 # NO
 libraries/
 data/
+*.h
+*.tflite
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

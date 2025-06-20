@@ -4,46 +4,70 @@
 */
 
 // ---------- Librerías ----------
+#include <Arduino.h>
 #include <Servo.h>
-#include <WiFi.h>
 #include <math.h>
+#include <arduinoFFT.h>
+#include "model_data.h"
 
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/version.h"
 
 // ---------- Pines  ----------
 // Sensor de captura de audio ISD1820
-#define PIN_REC       26
 #define PIN_AUDIO     34
-uint16_t audioBuffer[1024];
 
 // Sensor ultrasónico HC-SR04
 #define TRIG_PIN      13
 #define ECHO_PIN      27
-long duration;
-int distance;
 
 // Sensor de efecto Hall
-#define HALL_PIN      34
+#define HALL_PIN      32
 
 // Módulo de relé de 2 canales
-#define RELAY1_PIN    12 // Servo
-#define RELAY2_PIN    2  // Stepper
+#define RELAY1_PIN    2 // Servo
+#define RELAY2_PIN    4  // Stepper
 
 // Servomotor MG995
-#define SERVO_PIN     32
+#define SERVO_PIN     5
 Servo servo1;
 
 // Motor paso a paso NEMA17 con driver a4988
-#define PIN_DIR       33
-#define PIN_STEP      32
+#define PIN_DIR       18
+#define PIN_STEP      19
 
 
-// ---------- Parámetros y variables de entorno ----------
-// Configuración de WiFi (No públicos lol)
-const char* ssid = "";
-const char* password = "";
-const char* host = "";
-const uint16_t port = 5000;
-WiFiClient client;
+// ---------- Constantes ---------
+
+// ---------- Parámetros y variables de entorno----------
+// Buffers de audio
+arduinoFFT FFT = arduinoFFT();
+#define SAMPLE_RATE 16000
+#define AUDIO_BUFFER_SIZE 16000
+#define FRAME_LENGTH 400
+#define FRAME_STRIDE 160
+#define FFT_LENGTH 512
+#define NUM_FILTERS 41
+#define NOISE_FLOOR_DB -57.0
+
+float audio_buffer[AUDIO_BUFFER_SIZE];
+float mfe_output[4018];
+float window[FRAME_LENGTH];
+float mel_filters[NUM_FILTERS][FFT_LENGTH / 2 + 1];
+
+// Modelo de aprendizaje profundo
+constexpr int kTensorArenaSize = 50 * 1024;
+uint8_t tensor_arena[kTensorArenaSize];
+tflite::MicroInterpreter* interpreter;
+TfLiteTensor* input;
+TfLiteTensor* output;
+
+// Funcionamiento HC-SR04
+long duration;
+int distance;
 
 // Intensidad de campo magnético
 const int umbralMaximo = 800; // Ajustar con pruebas en la vida real
@@ -52,11 +76,12 @@ const int umbralMaximo = 800; // Ajustar con pruebas en la vida real
 int maxDistancia = 3;
 
 // Asumimos que el sistema se puede simplificar a una circunferencia unitaria
-const int coordenadas[4][2] = { 
-  {0, 1},   // Bottle, siempre el estado inicial
-  {1, 0},   // Can
-  {0, -1},  // Noise + Pong
-  {-1, 0}   // Paper
+const int coordenadas[5][2] = { 
+  {0, 1},   // 0 - Bottle, siempre el estado inicial
+  {1, 0},   // 1 - Can
+  {0, 0},   // 2 - Noise
+  {0, -1},  // 3 - Ping pong
+  {-1, 0}   // 4 - Paper
 };
 
 int estadoActual = 0;
@@ -71,14 +96,24 @@ const int angularMinima = 3000;
 // ---------- Programa principal ----------
 void setup() {
   Serial.begin(115200);  // Comunicación serial
-  connect();
+  analogReadResolution(12);
+
+  // ---------- Inicio de constantes y modelo ----------
+  generate_hamming_window();
+  generate_mel_filterbank();
+
+  static tflite::MicroErrorReporter micro_error_reporter;
+  tflite::AllOpsResolver resolver;
+  const tflite::Model* model = tflite::GetModel(model_data);
+  interpreter = new tflite::MicroInterpreter(model, resolver, tensor_arena, kTensorArenaSize, &micro_error_reporter);
+  interpreter->AllocateTensors();
+  input = interpreter->input(0);
+  output = interpreter->output(0);
 
   // ---------- Configuración de pines ----------
   // Configurar pines del ISD1820 para grabación
-  pinMode(PIN_REC, OUTPUT);
   pinMode(PIN_AUDIO, INPUT);
-  digitalWrite(PIN_REC, HIGH); // Mantenerlo en HIGH para permitir la grabación
-  
+
   // Configurar pines del sensor ultrasónico
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
@@ -118,23 +153,18 @@ void setup() {
   Serial.println("Preparao.");
 }
 
-void loop() {
+void loop(){
   // En bucle, va esperando a que un objeto entre en el rango del detector de basura.
   delay(1000);
 
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.begin(ssid, password);
-    delay(5000);
-  }else{
-    bool basura = detectarBasura();
-    if (basura) {
-      // Apenas la detecta, abre el micrófono y empieza a grabar.
-      uint16_t audioData = captureAudio();
+  bool basura = detectarBasura();
+  if (basura) {
+    capture_audio();
+    compute_mfe(audio_buffer);
+    estadoObjetivo = prediction(mfe_output);
+    delay(1000);
 
-      // Manda el audio al modelo de predicción por internet y recibe la clase como entero posicional
-      estadoObjetivo = sendToModel(audioData);
-      delay(1000);
-
+    if (estadoObjetivo != 2){ // Solo si no es ruido, que se mueva.
       // Rotación de la plataforma circular
       digitalWrite(RELAY2_PIN, HIGH);
       actuadorStepper(estadoObjetivo);
@@ -161,11 +191,115 @@ void loop() {
       O es uno, o el otro, o ninguno.
       */
     }
-  } 
+  }
 }
 
-
 // ---------- Funciones agregadas ----------
+// Funciones auxiliares de procesamiento de audio
+float hz_to_mel(float hz) {
+  return 2595.0f * log10(1.0f + hz / 700.0f);
+}
+
+float mel_to_hz(float mel) {
+  return 700.0f * (pow(10.0f, mel / 2595.0f) - 1.0f);
+}
+
+void generate_hamming_window() {
+  for (int i = 0; i < FRAME_LENGTH; i++) {
+    window[i] = 0.54 - 0.46 * cos(2 * PI * i / (FRAME_LENGTH - 1));
+  }
+}
+
+void generate_mel_filterbank() {
+  float low_mel = hz_to_mel(80);
+  float high_mel = hz_to_mel(SAMPLE_RATE / 2);
+  float mel_points[NUM_FILTERS + 2];
+
+  for (int i = 0; i < NUM_FILTERS + 2; i++) {
+    mel_points[i] = mel_to_hz(low_mel + (high_mel - low_mel) * i / (NUM_FILTERS + 1));
+  }
+
+  int bin[NUM_FILTERS + 2];
+  for (int i = 0; i < NUM_FILTERS + 2; i++) {
+    bin[i] = floor((FFT_LENGTH + 1) * mel_points[i] / SAMPLE_RATE);
+  }
+
+  for (int i = 0; i < NUM_FILTERS; i++) {
+    for (int k = 0; k < FFT_LENGTH / 2 + 1; k++) {
+      float w = 0.0;
+      if (k >= bin[i] && k <= bin[i + 1])
+        w = (float)(k - bin[i]) / (bin[i + 1] - bin[i]);
+      else if (k >= bin[i + 1] && k <= bin[i + 2])
+        w = (float)(bin[i + 2] - k) / (bin[i + 2] - bin[i + 1]);
+      mel_filters[i][k] = w;
+    }
+  }
+}
+
+void compute_mfe(float* audio) {
+  int frame_count = (AUDIO_BUFFER_SIZE - FRAME_LENGTH) / FRAME_STRIDE + 1;
+
+  for (int f = 0; f < frame_count; f++) {
+    float frame[FRAME_LENGTH];
+    float vReal[FFT_LENGTH];
+    float vImag[FFT_LENGTH];
+
+    for (int i = 0; i < FRAME_LENGTH; i++) {
+      frame[i] = audio[f * FRAME_STRIDE + i] * window[i];
+    }
+
+    for (int i = 0; i < FRAME_LENGTH; i++) vReal[i] = frame[i];
+    for (int i = FRAME_LENGTH; i < FFT_LENGTH; i++) vReal[i] = 0;
+    for (int i = 0; i < FFT_LENGTH; i++) vImag[i] = 0;
+
+    FFT.Windowing(vReal, FFT_LENGTH, FFT_WIN_TYP_RECTANGLE, FFT_FORWARD);
+    FFT.Compute(vReal, vImag, FFT_LENGTH, FFT_FORWARD);
+    FFT.ComplexToMagnitude(vReal, vImag, FFT_LENGTH);
+
+    for (int m = 0; m < NUM_FILTERS; m++) {
+      float energy = 0.0;
+      for (int k = 0; k < FFT_LENGTH / 2 + 1; k++) {
+        energy += vReal[k] * vReal[k] * mel_filters[m][k];
+      }
+      energy = 10.0 * log10(max(energy, 1e-30f));
+      energy = (energy - NOISE_FLOOR_DB) / ((-1 * NOISE_FLOOR_DB) + 12);
+      energy = constrain(energy, 0.0, 1.0);
+      mfe_output[f * NUM_FILTERS + m] = energy;
+    }
+  }
+}
+
+// Función de captura de audio
+void capture_audio() {
+  unsigned long start_time = micros();
+  for (int i = 0; i < AUDIO_BUFFER_SIZE; i++) {
+    int raw = analogRead(PIN_AUDIO);
+    float centered = (raw - 2048.0f) / 2048.0f;
+    audio_buffer[i] = centered;
+    while ((micros() - start_time) < ((i + 1) * 1000000L / SAMPLE_RATE));
+  }
+}
+
+// Funciones de clasificación
+int prediction(float* features) {
+  for (int i = 0; i < 4018; i++) {
+    input->data.f[i] = features[i];
+  }
+  if (interpreter->Invoke() != kTfLiteOk) {
+    Serial.println("Inference failed");
+    return -1;
+  }
+  int top_index = 0;
+  float top_prob = output->data.f[0];
+  for (int i = 1; i < output->dims->data[1]; i++) {
+    if (output->data.f[i] > top_prob) {
+      top_prob = output->data.f[i];
+      top_index = i;
+    }
+  }
+  return top_index;
+}
+
 // Función detección de distancia
 bool detectarBasura(){
   // Enviar un pulso al TRIG_PIN
@@ -185,61 +319,6 @@ bool detectarBasura(){
   } else {
     return false;
   }
-}
-
-// Captura de audio
-uint16_t* captureAudio() {
-  // Iniciar grabación
-  digitalWrite(PIN_REC, LOW);  // Iniciar grabación (baja a LOW)
-  delay(10000);  // Grabar durante 10 segundos
-  digitalWrite(PIN_REC, HIGH); // Detener grabación (sube a HIGH)
-
-  // Capturar las muestras de audio
-  uint16_t audioData[1024];  // Buffer para las muestras de audio
-
-  for (int i = 0; i < 1024; i++) {
-    audioBuffer[i] = analogRead(PIN_AUDIO);  // Leer el valor de la señal
-    delayMicroseconds(100);  // Ajusta la velocidad de captura (aproximadamente 10kHz)
-  }
-
-  return audioBuffer;
-}
-
-// Funciones de WiFI
-void connect(){
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED){
-    delay(500);
-  }
-  Serial.println("Conectado a WiFi.")
-}
-
-int sendToModel(uint16_t* audioData){
-  int response = 0;
-
-  if (client.connect(host, port)) {
-    Serial.println("Conexión establecida con el servidor.");
-
-    // Crear una cadena CSV con los valores de audio almacenados en audioBuffer
-    String audioCSV = "";
-    for (int i = 0; i < 1024; i++) {
-      audioCSV += String(audioData[i]);
-      if (i < 1023) audioCSV += ",";  // Separar por comas
-    }
-
-    // Enviar la cadena CSV al servidor
-    client.print(audioCSV); 
-
-    // Esperar respuesta del servidor
-    String responseStr = client.readString();
-    response = responseStr.toInt();
-  } else {
-    Serial.println("Error al conectar al servidor.");
-  }
-
-  // Cerrar la conexión
-  client.stop();
-  return response;
 }
 
 // Movimiento stepper
