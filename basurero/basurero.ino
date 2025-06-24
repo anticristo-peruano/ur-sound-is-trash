@@ -8,7 +8,7 @@
 #include <Servo.h>
 #include <math.h>
 #include <arduinoFFT.h>
-#include "model_data.h"
+#include "model.h"
 
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
@@ -68,12 +68,13 @@ TfLiteTensor* output;
 // Funcionamiento HC-SR04
 long duration;
 int distance;
+int maxDistance = 26; // 26 cm máximo umbral de objecto en rango de detección
 
 // Intensidad de campo magnético
 const int umbralMaximo = 800; // Ajustar con pruebas en la vida real
 
 // Distancia de detección (en cm)
-int maxDistancia = 3;
+
 
 // Asumimos que el sistema se puede simplificar a una circunferencia unitaria
 const int coordenadas[5][2] = { 
@@ -311,10 +312,10 @@ bool detectarBasura(){
 
   // Leer la duración del pulso de vuelta desde el ECHO_PIN
   duration = pulseIn(ECHO_PIN, HIGH);  // Medir el tiempo del pulso
-  distance = duration * 0.034 / 2;  // La velocidad del sonido es 343 m/s o 0.034 cm/us
+  distance = duration * 0.017;  // La velocidad del sonido es 343 m/s o 0.034 cm/us
 
   // Si la distancia es menor que un umbral retorna true (objeto detectado)
-  if (distance <= maxDistancia) {
+  if (distance <= maxDistance) {
     return true;
   } else {
     return false;
