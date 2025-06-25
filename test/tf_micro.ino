@@ -12,7 +12,7 @@
 #define FRAME_STRIDE       160              // 10 ms
 #define FFT_LENGTH         512              // Potencia de 2
 #define NUM_FILTERS        41               // Número de filtros Mel
-#define NOISE_FLOOR_DB     -57
+#define NOISE_FLOOR_DB     -35
 #define PIN_AUDIO          34               // GPIO34 como entrada analógica en ESP32
 
 // ========================== MODELO ============================= //
@@ -59,7 +59,7 @@ void setup() {
   generate_hamming_window();
   generate_mel_filterbank(mel_filters);
 
-  model = tflite::GetModel(model_quantized_int8_tflite);
+  model = tflite::GetModel(model_float32_tflite);
   if (model->version() != TFLITE_SCHEMA_VERSION) {
     MicroPrintf(
       "Model provided is schema version %d not equal to supported "
@@ -69,12 +69,10 @@ void setup() {
     return;
   }
 
-  static tflite::MicroMutableOpResolver<11> resolver;
+  static tflite::MicroMutableOpResolver<9> resolver;
   resolver.AddFullyConnected();
   resolver.AddReshape();
-  resolver.AddSoftmax();
-  resolver.AddQuantize();    
-  resolver.AddDequantize();   
+  resolver.AddSoftmax();  
   resolver.AddShape();
   resolver.AddStridedSlice();
   resolver.AddPack();
@@ -99,9 +97,30 @@ void setup() {
 void loop() {
   Serial.println("Capturando 1 segundo de audio...");
   float* audio_buffer = capture_audio();
+  
+  Serial.println("Audio capturado. Mostrando 10 muestras:");
+  for (int i = 0; i < 10; i++) {
+    Serial.print(audio_buffer[i]);
+    Serial.print(", ");
+  }
+  Serial.println();
+  Serial.println("Últimas 10 muestras:");
+  for (int i = AUDIO_BUFFER_SIZE - 10; i < AUDIO_BUFFER_SIZE; i++) {
+    Serial.print(audio_buffer[i], 0);
+    Serial.print(", ");
+  }
+  Serial.println();
+
   int frame_count = (AUDIO_BUFFER_SIZE - FRAME_LENGTH) / FRAME_STRIDE + 1;
   float* mfe_output = (float*) malloc(sizeof(float) * frame_count * NUM_FILTERS);
   compute_mfe(audio_buffer, mfe_output, frame_count);
+
+  Serial.println("Características MFE:");
+  for (int i = 0; i < frame_count * NUM_FILTERS; i++) {
+    Serial.print(mfe_output[i], 6);
+    Serial.print(", ");
+  }
+  Serial.println("\n");
 
   Serial.println(prediction(mfe_output));
   free(audio_buffer);
@@ -193,7 +212,7 @@ void compute_mfe(float* audio, float* mfe_output, int frame_count) {
 
       // Replicando comportamiento de Edge Impulse
       energy = 10.0 * log10f(max(energy,1e-30f));
-      energy = (energy - NOISE_FLOOR_DB) / ((-1.0 * NOISE_FLOOR_DB) + 12.0) - 1.0;
+      energy = (energy - NOISE_FLOOR_DB) / ((-1.0 * NOISE_FLOOR_DB) + 12.0) - 2.0;
       energy = constrain(energy, 0.0, 1.0);
       //energy = round(energy * 256.0);
       //energy = constrain(energy,0.0f,255.0f);
@@ -208,7 +227,7 @@ float* capture_audio() {
   float* output = (float*) malloc(sizeof(float) * AUDIO_BUFFER_SIZE);
   unsigned long start_time = micros();
   for (int i = 0; i < AUDIO_BUFFER_SIZE; i++) {
-    output[i] = analogRead(PIN_AUDIO) - 2048.0f;
+    output[i] = analogRead(PIN_AUDIO) - 2048.0f + 150.0f;
     while ((micros() - start_time) < ((i + 1) * 1000000L / SAMPLE_RATE));
   }
   return output;
@@ -216,17 +235,26 @@ float* capture_audio() {
 
 int prediction(float* features) {
   for (int i = 0; i < 4018; i++) {
-    input->data.f[i] = features[i];
+    input->data.f[i] = features[i];  // sin cuantizar
   }
-  if (interpreter->Invoke() != kTfLiteOk) {
-    Serial.println("Inference failed");
+
+  TfLiteStatus invoke_status = interpreter->Invoke();
+  if (invoke_status != kTfLiteOk) {
+    Serial.println("Error invoking.");
     return -1;
   }
+
   int top_index = 0;
-  float top_prob = output->data.f[0];
-  for (int i = 1; i < output->dims->data[1]; i++) {
-    if (output->data.f[i] > top_prob) {
-      top_prob = output->data.f[i];
+  float top_score = output->data.f[0];
+
+  for (int i = 0; i < output->dims->data[1]; i++) {
+    Serial.print("Clase ");
+    Serial.print(i);
+    Serial.print(": ");
+    Serial.println(output->data.f[i], 6);  // más precisión
+
+    if (output->data.f[i] > top_score) {
+      top_score = output->data.f[i];
       top_index = i;
     }
   }
