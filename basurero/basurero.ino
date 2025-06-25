@@ -73,8 +73,6 @@ int maxDistance = 26; // 26 cm máximo umbral de objecto en rango de detección
 // Intensidad de campo magnético
 const int umbralMaximo = 800; // Ajustar con pruebas en la vida real
 
-// Distancia de detección (en cm)
-
 
 // Asumimos que el sistema se puede simplificar a una circunferencia unitaria
 const int coordenadas[5][2] = { 
