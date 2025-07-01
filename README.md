@@ -8,7 +8,7 @@
 # Principios físicos
 
 <p align="center">
-    <img src="./src/spectros.jpeg">
+    <img src="./src/spectros.png">
 </p>
 
 # Descripción del prototipo
@@ -18,8 +18,8 @@
 </p>
 
 <p align="center">
-    <img src="./src/schematic.png">
-    <img src="./src/logicvolt.png">
+    <img src="./src/schematic.jpeg">
+    <img src="./src/logicvolt.jpeg">
 </p>
 
 # Desempeño del modelo de clasificación
